@@ -17,6 +17,8 @@ nconf.argv().file(path.resolve(
   dropbox: {},
   aws: {},
   retry: 10000,
+  'aws-retry': 1000,
+  'aws-max-retry': 5,
   parallel: 8
 });
 
@@ -62,6 +64,24 @@ function dropboxRetry(fn, cb) {
       }, nconf.get('retry'));
       return;
     }
+    cb.apply(this, arguments);
+  });
+}
+
+function awsRetry(fn, cb, failures) {
+  if (!failures) failures = 0;
+  fn(function(err) {
+    if (err) {
+      if (failures >= nconf.get('aws-max-retry')) {
+        return cb(err);
+      }
+
+      setTimeout(function() {
+        awsRetry(fn, cb, failures + 1);
+      }, nconf.get('aws-retry'));
+      return;
+    }
+
     cb.apply(this, arguments);
   });
 }
@@ -161,10 +181,12 @@ function upload(file, cb) {
         if (err) return finish(err);
 
         console.log('Uploading %s to S3', fullPath);
-        clients.aws.upload({
-          container: nconf.get('aws').container,
-          remote: sanitize(fullPath),
-          stream: request(res.url)
+        awsRetry(function(cb) {
+          clients.aws.upload({
+            container: nconf.get('aws').container,
+            remote: sanitize(fullPath),
+            stream: request(res.url)
+          }, cb);
         }, finish);
       });
     }
