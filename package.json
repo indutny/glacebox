@@ -11,7 +11,6 @@
   "license": "BSD",
   "dependencies": {
     "dropbox": "~0.9.2",
-    "aws-sdk": "~0.9.9-pre.10",
     "nconf": "~0.6.7",
     "async": "~0.2.8",
     "archiver": "~0.4.3",
