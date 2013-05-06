@@ -1,0 +1,190 @@
+#!/usr/bin/env node
+var path = require('path'),
+    fs = require('fs'),
+    assert = require('assert'),
+    request = require('request'),
+    async = require('async'),
+    nconf = require('nconf'),
+    dropbox = require('dropbox'),
+    archiver = require('archiver'),
+    aws = require('aws-sdk');
+
+var Buffer = require('buffer').Buffer;
+
+nconf.argv().file(path.resolve(
+  process.env.HOME,
+  '.glacebox.json'
+)).defaults({
+  dropbox: {},
+  aws: {},
+  retry: 10000,
+  parallel: 8
+});
+
+aws.config.update(nconf.get('aws'));
+
+var clients = {
+  dropbox: new dropbox.Client({
+    key: nconf.get('dropbox').key,
+    secret: nconf.get('dropbox').secret
+  }),
+  aws: new aws.Glacier({
+    params: {
+      accountId: nconf.get('aws').accountId,
+      vaultName: nconf.get('aws').vault
+    }
+  })
+};
+
+clients.dropbox.authDriver(new dropbox.Drivers.NodeServer(8191));
+
+function getTmpFile() {
+  return '/tmp/' + (+new Date) + process.hrtime().join(':') + '.tar';
+}
+
+function retry(fn, cb) {
+  fn(function ondone(err) {
+    if (err && err.status === 503) {
+      // Retry
+      console.log('Rate limit reached, waiting...');
+      setTimeout(function() {
+        fn(ondone);
+      }, nconf.get('retry'));
+      return;
+    }
+    cb.apply(this, arguments);
+  });
+}
+
+var queue = [],
+    active = 0;
+
+function upload(file, archive, cb) {
+  if (active >= nconf.get('parallel')) {
+    queue.push(function() {
+      upload(file, archive, cb);
+    });
+    return;
+  }
+
+  var fullPath = path.join.apply(null, file);
+  active++;
+  var dequeue = function() {
+    dequeue = null;
+    active--;
+    while (queue.length > 0 && active < nconf.get('parallel')) {
+      queue.shift()();
+    }
+  }
+
+  function finish(err) {
+    if (dequeue) dequeue();
+    cb(err);
+  }
+
+  retry(function(cb) {
+    clients.dropbox.stat(fullPath, cb);
+  }, function(err, stat) {
+    if (err) return finish(err);
+
+    if (stat.isFolder) {
+      retry(function(cb) {
+        clients.dropbox.readdir(fullPath, cb);
+      }, function(err, entries) {
+        if (err) return finish(err);
+
+        var archive = archiver('tar'),
+            tmp = getTmpFile();
+
+        dequeue();
+        async.series([
+          async.forEach.bind(async, entries, function(name, cb) {
+            upload(file.concat(name), archive, cb);
+          }),
+          archive.finalize.bind(archive),
+          function(cb) {
+            var chunk,
+                chunks = [],
+                len = 0;
+
+            while (chunk = archive.read()) {
+              chunks.push(chunk);
+              len += chunk.length;
+            }
+
+            var big = Buffer.concat(chunks, len);
+            chunks = null;
+
+            console.log('Uploading %d bytes to Glacier', big.length);
+            clients.aws.uploadArchive({
+              archiveDescription: fullPath,
+              body: big
+            }, cb);
+          }
+        ], finish);
+      });
+    } else {
+      retry(function(cb) {
+        clients.dropbox.makeUrl(fullPath, { download: true }, cb);
+      }, function(err, res) {
+        if (err) return finish(err);
+
+        assert.ok(archive);
+        var name = file[file.length -1];
+        console.log('Downloading: %s (%s)', name, fullPath);
+
+        var req = request(res.url);
+        archive.append(req, {
+          name: file[file.length - 1]
+        });
+
+        var once = false;
+        req.once('error', function(err) {
+          if (once) return;
+          once = true;
+          finish(err);
+        });
+
+        req.once('end', function() {
+          if (once) return;
+          once = true;
+
+          console.log('Download finished: %s (%s)', name, fullPath);
+          finish(null);
+        });
+      });
+    }
+  });
+}
+
+function log(action, msg) {
+  return function(cb) {
+    var once = false;
+    action(function(err) {
+      if (once) return;
+      once = true;
+
+      if (err) {
+        console.error('!!! "%s" failed', msg, err);
+      } else {
+        console.log(msg);
+      }
+      cb(err);
+    });
+  };
+};
+
+async.series([
+  async.parallel.bind(null, [
+    log(clients.dropbox.authenticate.bind(clients.dropbox), 'Dropbox login'),
+    log(clients.aws.createVault.bind(clients.aws, {}), 'AWS Vault create'),
+  ]),
+  upload.bind(null, [ '/' ], null)
+], function(err) {
+  if (err) throw err;
+  console.log('! Done');
+});
+
+
+// Ignore leaks, I'm aware of them
+process.setMaxListeners(10000);
