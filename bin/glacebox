@@ -6,7 +6,7 @@ var path = require('path'),
     async = require('async'),
     nconf = require('nconf'),
     dropbox = require('dropbox'),
-    archiver = require('archiver'),
+    pkgcloud = require('pkgcloud'),
     aws = require('aws-sdk');
 
 var Buffer = require('buffer').Buffer;
@@ -21,34 +21,45 @@ nconf.argv().file(path.resolve(
   parallel: 8
 });
 
-aws.config.update(nconf.get('aws'));
-
 var clients = {
   dropbox: new dropbox.Client({
     key: nconf.get('dropbox').key,
     secret: nconf.get('dropbox').secret
   }),
-  aws: new aws.Glacier({
-    params: {
-      accountId: nconf.get('aws').accountId,
-      vaultName: nconf.get('aws').vault
-    }
+  aws: pkgcloud.storage.createClient({
+    provider: 'amazon',
+    key: nconf.get('aws').secretAccessKey,
+    keyId: nconf.get('aws').accessKeyId
   })
 };
 
+// Main
 clients.dropbox.authDriver(new dropbox.Drivers.NodeServer(8191));
 
-function getTmpFile() {
-  return '/tmp/' + (+new Date) + process.hrtime().join(':') + '.tar';
-}
+async.series([
+  async.parallel.bind(null, [
+    log(clients.dropbox.authenticate.bind(clients.dropbox), 'Dropbox login'),
+    log(clients.aws.createContainer.bind(
+      clients.aws,
+      nconf.get('aws').container
+    ), 'AWS container create'),
+  ]),
+  upload.bind(null, [ '/' ])
+], function(err) {
+  if (err) throw err;
+  console.log('! Done');
+});
 
-function retry(fn, cb) {
+// Ignore leaks, I'm aware of them
+process.setMaxListeners(10000);
+
+function dropboxRetry(fn, cb) {
   fn(function ondone(err) {
     if (err && err.status === 503) {
       // Retry
       console.log('Rate limit reached, waiting...');
       setTimeout(function() {
-        fn(ondone);
+        dropboxRetry(fn, cb);
       }, nconf.get('retry'));
       return;
     }
@@ -59,10 +70,10 @@ function retry(fn, cb) {
 var queue = [],
     active = 0;
 
-function upload(file, archive, cb) {
+function upload(file, cb) {
   if (active >= nconf.get('parallel')) {
     queue.push(function() {
-      upload(file, archive, cb);
+      upload(file, cb);
     });
     return;
   }
@@ -82,76 +93,34 @@ function upload(file, archive, cb) {
     cb(err);
   }
 
-  retry(function(cb) {
+  dropboxRetry(function(cb) {
     clients.dropbox.stat(fullPath, cb);
   }, function(err, stat) {
     if (err) return finish(err);
 
     if (stat.isFolder) {
-      retry(function(cb) {
+      dropboxRetry(function(cb) {
         clients.dropbox.readdir(fullPath, cb);
       }, function(err, entries) {
         if (err) return finish(err);
 
-        var archive = archiver('tar'),
-            tmp = getTmpFile();
-
         dequeue();
-        async.series([
-          async.forEach.bind(async, entries, function(name, cb) {
-            upload(file.concat(name), archive, cb);
-          }),
-          archive.finalize.bind(archive),
-          function(cb) {
-            var chunk,
-                chunks = [],
-                len = 0;
-
-            while (chunk = archive.read()) {
-              chunks.push(chunk);
-              len += chunk.length;
-            }
-
-            var big = Buffer.concat(chunks, len);
-            chunks = null;
-
-            console.log('Uploading %d bytes to Glacier', big.length);
-            clients.aws.uploadArchive({
-              archiveDescription: fullPath,
-              body: big
-            }, cb);
-          }
-        ], finish);
+        async.forEach(entries, function(name, cb) {
+            upload(file.concat(name), cb);
+        }, finish);
       });
     } else {
-      retry(function(cb) {
+      dropboxRetry(function(cb) {
         clients.dropbox.makeUrl(fullPath, { download: true }, cb);
       }, function(err, res) {
         if (err) return finish(err);
 
-        assert.ok(archive);
-        var name = file[file.length -1];
-        console.log('Downloading: %s (%s)', name, fullPath);
-
-        var req = request(res.url);
-        archive.append(req, {
-          name: file[file.length - 1]
-        });
-
-        var once = false;
-        req.once('error', function(err) {
-          if (once) return;
-          once = true;
-          finish(err);
-        });
-
-        req.once('end', function() {
-          if (once) return;
-          once = true;
-
-          console.log('Download finished: %s (%s)', name, fullPath);
-          finish(null);
-        });
+        console.log('Uploading %s to S3', fullPath);
+        clients.aws.upload({
+          container: nconf.get('aws').container,
+          remote: escape(fullPath.replace(/^\//, '')),
+          stream: request(res.url)
+        }, finish);
       });
     }
   });
@@ -173,18 +142,3 @@ function log(action, msg) {
     });
   };
 };
-
-async.series([
-  async.parallel.bind(null, [
-    log(clients.dropbox.authenticate.bind(clients.dropbox), 'Dropbox login'),
-    log(clients.aws.createVault.bind(clients.aws, {}), 'AWS Vault create'),
-  ]),
-  upload.bind(null, [ '/' ], null)
-], function(err) {
-  if (err) throw err;
-  console.log('! Done');
-});
-
-
-// Ignore leaks, I'm aware of them
-process.setMaxListeners(10000);

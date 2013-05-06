@@ -15,6 +15,7 @@
     "nconf": "~0.6.7",
     "async": "~0.2.8",
     "archiver": "~0.4.3",
-    "request": "~2.21.0"
+    "request": "~2.21.0",
+    "pkgcloud": "~0.6.15"
   }
 }
