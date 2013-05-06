@@ -102,8 +102,11 @@ var transliterate = {
 
 function sanitize(path) {
   path = path.replace(/^\//, '');
-  path = path.replace(/[^a-z0-9\.\s\-]/gi, function(c) {
-    return transliterate[c.toLowerCase()] || '';
+  path = path.replace(/[^a-z0-9\.\s\-\/]/gi, function(c) {
+    var isUpper = c.toLowerCase() !== c;
+    var out = transliterate[c.toLowerCase()] || '';
+    if (isUpper) out = out.toUpperCase();
+    return out;
   });
   path = escape(path);
   return path;
