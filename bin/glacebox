@@ -17,8 +17,7 @@ nconf.argv().file(path.resolve(
   dropbox: {},
   aws: {},
   retry: 10000,
-  'aws-retry': 1000,
-  'aws-max-retry': 5,
+  'max-retry': 5,
   parallel: 8
 });
 
@@ -54,31 +53,19 @@ async.series([
 // Ignore leaks, I'm aware of them
 process.setMaxListeners(10000);
 
-function dropboxRetry(fn, cb) {
-  fn(function ondone(err) {
-    if (err && err.status === 503) {
-      // Retry
-      console.log('Rate limit reached, waiting...');
-      setTimeout(function() {
-        dropboxRetry(fn, cb);
-      }, nconf.get('retry'));
-      return;
-    }
-    cb.apply(this, arguments);
-  });
-}
-
-function awsRetry(fn, cb, failures) {
+function retry(fn, cb, failures) {
   if (!failures) failures = 0;
   fn(function(err) {
     if (err) {
-      if (failures >= nconf.get('aws-max-retry')) {
+      console.log('Action failed %d times', failures);
+      if (failures >= nconf.get('max-retry')) {
+        console.log('Stop retrying');
         return cb(err);
       }
 
       setTimeout(function() {
-        awsRetry(fn, cb, failures + 1);
-      }, nconf.get('aws-retry'));
+        retry(fn, cb, failures + 1);
+      }, nconf.get('retry'));
       return;
     }
 
@@ -158,13 +145,13 @@ function upload(file, cb) {
     cb(err);
   }
 
-  dropboxRetry(function(cb) {
+  retry(function(cb) {
     clients.dropbox.stat(fullPath, cb);
   }, function(err, stat) {
     if (err) return finish(err);
 
     if (stat.isFolder) {
-      dropboxRetry(function(cb) {
+      retry(function(cb) {
         clients.dropbox.readdir(fullPath, cb);
       }, function(err, entries) {
         if (err) return finish(err);
@@ -175,13 +162,13 @@ function upload(file, cb) {
         }, finish);
       });
     } else {
-      dropboxRetry(function(cb) {
+      retry(function(cb) {
         clients.dropbox.makeUrl(fullPath, { download: true }, cb);
       }, function(err, res) {
         if (err) return finish(err);
 
         console.log('Uploading %s to S3', fullPath);
-        awsRetry(function(cb) {
+        retry(function(cb) {
           clients.aws.upload({
             container: nconf.get('aws').container,
             remote: sanitize(fullPath),
