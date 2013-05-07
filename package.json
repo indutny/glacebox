@@ -1,11 +1,11 @@
 {
   "name": "glacebox",
   "version": "0.0.0",
-  "description": "ERROR: No README.md file found!",
-  "main": "lib/glacebox.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "description": "Dropbox to S3/Glacier sync",
+  "bin": {
+    "glacebox": "./bin/glacebox"
   },
+  "main": "lib/glacebox.js",
   "repository": "",
   "author": "",
   "license": "BSD",
